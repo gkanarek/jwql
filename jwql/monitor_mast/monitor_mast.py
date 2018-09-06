@@ -5,6 +5,7 @@ Authors
 -------
 
     Joe Filippazzo
+    Gray Kanarek
 
 Use
 ---
@@ -20,14 +21,26 @@ import logging
 import os
 
 from astroquery.mast import Mast
-from bokeh.charts import Donut, save, output_file
-from bokeh.embed import components
 import pandas as pd
 
 from jwql.logging.logging_functions import configure_logging, log_info, log_fail
 from jwql.permissions.permissions import set_permissions
 from jwql.utils.utils import get_config, JWST_DATAPRODUCTS, JWST_INSTRUMENTS
+from jwql.bokeh_templating import BokehTemplate
 
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+fig_formats = """
+Donut:
+    label: ['instrument', 'dataproduct']
+    values: 'files'
+    text_font_size: '12pt'
+    hover_text: 'files'
+    name: "JWST Inventory"
+    plot_width: 600
+    plot_height: 600
+"""
+    
 
 def instrument_inventory(instrument, dataproduct=JWST_DATAPRODUCTS,
                          add_filters=None, add_requests=None,
@@ -140,7 +153,7 @@ def instrument_keywords(instrument, caom=False):
 
 def jwst_inventory(instruments=JWST_INSTRUMENTS,
                    dataproducts=['image', 'spectrum', 'cube'],
-                   caom=False, plot=False):
+                   caom=False):
     """Gather a full inventory of all JWST data in each instrument
     service by instrument/dtype
 
@@ -190,69 +203,74 @@ def jwst_inventory(instruments=JWST_INSTRUMENTS,
                     value_vars=dataproducts,
                     value_name='files', var_name='dataproduct')
 
-    # Plot it
-    if plot:
-        # Determine plot location and names
-        output_dir = get_config()['outputs']
-
-        if caom:
-            output_filename = 'database_monitor_caom'
-        else:
-            output_filename = 'database_monitor_jwst'
-
-        # Make the plot
-        plt = Donut(table, label=['instrument', 'dataproduct'], values='files',
-                    text_font_size='12pt', hover_text='files',
-                    name="JWST Inventory", plot_width=600, plot_height=600)
-
-        # Save the plot as full html
-        html_filename = output_filename + '.html'
-        outfile = os.path.join(output_dir, 'monitor_mast', html_filename)
-        output_file(outfile)
-        save(plt)
-        set_permissions(outfile)
-
-        logging.info('Saved Bokeh plots as HTML file: {}'.format(html_filename))
-
-        # Save the plot as components
-        plt.sizing_mode = 'stretch_both'
-        script, div = components(plt)
-
-        div_outfile = os.path.join(output_dir, 'monitor_mast', output_filename + "_component.html")
-        with open(div_outfile, 'w') as f:
-            f.write(div)
-            f.close()
-        set_permissions(div_outfile)
-
-        script_outfile = os.path.join(output_dir, 'monitor_mast', output_filename + "_component.js")
-        with open(script_outfile, 'w') as f:
-            f.write(script)
-            f.close()
-        set_permissions(script_outfile)
-
-        logging.info('Saved Bokeh components files: {}_component.html and {}_component.js'.format(output_filename, output_filename))
-
     return table, keywords
 
+class MastMonitor(BokehTemplate):
+    
+    instruments = JWST_INSTRUMENTS
+    dataproducts = ['image', 'spectrum', 'cube']
+    
+    def pre_init(self):
+        self._embed = True
+        
+        #App design
+        self.format_string = None
+        self.interface_file = os.path.join(script_dir, "monitor_mast_interface.yaml")
+        
+        self.settings = get_config()
+        self.output_dir = self.settings['outputs']
+        
+        #Have to initialize DataFrames for plotting
+        self.monitor(initialize=True)
+        
+        
+    post_init = None
+    
+    @log_info
+    @log_fail
+    def monitor(self, initialize=False):
+        """Tabulates the inventory of all JWST data products in the MAST
+        archive and generates plots.
+        """
+        logging.info('Beginning database monitoring.')
+        self.jwst_table, self.jwst_keywords = jwst_inventory(self.instruments,
+                                                             self.dataproducts,
+                                                             caom=False)
+        self.caom_table, self.caom_keywords = jwst_inventory(self.instruments,
+                                                             self.dataproducts,
+                                                             caom=True)
+        if not initialize:
+            self.update_plots()
+    
+    def update_plots(self):
+        # Determine plot location and names
+        html_stub = 'database_monitor_{}_component.html'
+        js_stub = 'database_monitor_{}_component.js'
+        
+        self.refs["fig_jwst"].data = self.jwst_table
+        self.refs["fig_caom"].data = self.caom_table
 
-@log_fail
-@log_info
-def monitor_mast():
-    """Tabulates the inventory of all JWST data products in the MAST
-    archive and generates plots.
-    """
-    logging.info('Beginning database monitoring.')
+        # Save the plots as components
+        for name in ["jwst", "caom"]:
+            script, div = self.embed("fig_"+name)
+            html_name = html_stub.format(name)
+            js_name = js_stub.format(name)
+            div_outfile = os.path.join(self.output_dir, 'monitor_mast', 
+                                       html_name)
+            with open(div_outfile, 'w') as f:
+                f.write(div)
+                f.close()
+            set_permissions(div_outfile)
 
-    # Perform inventory of the JWST service
-    jwst_inventory(instruments=JWST_INSTRUMENTS,
-                   dataproducts=['image', 'spectrum', 'cube'],
-                   caom=False, plot=True)
+            script_outfile = os.path.join(self.output_dir, 'monitor_mast', 
+                                          js_name)
+            with open(script_outfile, 'w') as f:
+                f.write(script)
+                f.close()
+            set_permissions(script_outfile)
 
-    # Perform inventory of the CAOM service
-    jwst_inventory(instruments=JWST_INSTRUMENTS,
-                   dataproducts=['image', 'spectrum', 'cube'],
-                   caom=True, plot=True)
-
+            logging.info('Saved Bokeh components files: {} and {}'.format(html_name, 
+                                                                          js_name))
 
 if __name__ == '__main__':
 
@@ -261,4 +279,5 @@ if __name__ == '__main__':
     configure_logging(module)
 
     # Run the monitors
-    monitor_mast()
+    monitor = MastMonitor()
+    monitor.monitor()

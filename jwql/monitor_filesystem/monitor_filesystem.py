@@ -10,6 +10,7 @@ Authors
 -------
 
     - Misty Cracraft
+    - Gray Kanarek
 
 Use
 ---
@@ -24,21 +25,12 @@ Use
     import statements:
 
     ::
-        from monitor_filesystem import filesystem_monitor
-        from monitor_filesystem import plot_system_stats
+        from monitor_filesystem import MonitorFilesystem
 
 
     Required arguments (in a ``config.json`` file):
-    ``filepath`` - The path to the input file needs to be in a
-    ``config.json`` file in the ``utils`` directory
     ``outputs`` - The path to the output files needs to be in a
     ``config.json`` file in the ``utils`` directory.
-
-    Required arguments for plotting:
-    ``inputfile`` - The name of the file to save all of the system
-    statistics to
-    ``filebytype`` - The name of the file to save stats on fits type
-    files to
 
 
 Dependencies
@@ -50,13 +42,11 @@ Dependencies
 Notes
 -----
 
-    The ``monitor_filesystem`` function queries the filesystem,
+    The ``MonitorFilesystem.monitor`` function queries the filesystem,
     calculates the statistics and saves the output file(s) in the
-    directory specified in the ``config.json`` file.
-
-    The ``plot_system_stats`` function reads in the two specified files
-    of statistics and plots the figures to an html output page as well
-    as saving them to an output html file.
+    directory specified in the ``config.json`` file. Every time this function
+    is called, the associated plots will be updated, and the embeddable
+    components will be written out to the appropriate .html and .js files.
 """
 
 from collections import defaultdict
@@ -66,261 +56,225 @@ import numpy as np
 import os
 import subprocess
 
-from bokeh.embed import components
-from bokeh.layouts import gridplot
-from bokeh.plotting import figure, output_file, save
-
+from jwql.bokeh_templating import BokehTemplate
 from jwql.logging.logging_functions import configure_logging, log_info, log_fail
 from jwql.permissions.permissions import set_permissions
 from jwql.utils.utils import filename_parser
 from jwql.utils.utils import get_config
 
+script_dir = os.path.dirname(os.path.abspath(__file__))
 
-@log_fail
-@log_info
-def monitor_filesystem():
-    """Tabulates the inventory of the JWST filesystem, saving
-    statistics to files, and generates plots.
-    """
+fig_formats = """
+Figure:
+    tools: 'pan,box_zoom,reset,wheel_zoom,save'
+    x_axis_type: 'datetime'
+    x_axis_label: 'Date'
+    sizing_mode: 'stretch_both'
+Line:
+    line_width: 2
+    x: 'dates'
+Circle:
+    x: 'dates'
+Square:
+    x: 'dates'
+Triangle:
+    x: 'dates'
+Diamond:
+    x: 'dates'
+Asterisk:
+    x: 'dates'
+XGlyph:
+    x: 'dates'
+"""
 
-    # Begin logging
-    logging.info('Beginning filesystem monitoring.')
+class MonitorFilesystem(BokehTemplate):
+    
+    def pre_init(self):
+        self._embed = True
+        
+        #App design
+        self.format_string = fig_formats
+        self.interface_file = os.path.join(script_dir, "monitor_filesystem_interface.yaml")
+        
+        # Get path, directories and files in system and count files in all directories
+        self.settings = get_config()
+        self.filesystem = self.settings['filesystem']
+        self.outputs_dir = os.path.join(self.settings['outputs'], 'monitor_filesystem')
+        
+        self.statistics = defaultdict(list)
+        self.results = defaultdict(list)
+        self.sizes = defaultdict(list)
+        
+        self.types_k = ['circle', 'diamond', 'square', 'triangle', 
+                        'asterisk'] + ['x']*6
+        self.types_y = ['fits', 'uncal', 'cal', 'rate', 'rateint', 
+                        'i2d', 'nrc', 'nrs', 'nis', 'mir', 'fgs']
+        self.types_c = ['black', 'red', 'blue', 'green', 'orange', 'purple', 
+                        'midnightblue', 'springgreen', 'darkcyan', 
+                        'dodgerblue', 'darkred']
+        self.types_l = ['Total FITS files', 'Uncalibrated FITS files',
+                        'Calibrated FITS files', 'Rate FITS files',
+                        'Rateints FITS files', 'I2D FITS files',
+                        'NIRCam FITS files', 'NIRSpec FITS files',
+                        'NIRISS FITS files', 'MIRI FITS files',
+                        'FGS FITS files']
+        
+    post_init = None
+    
+    @log_fail
+    @log_info
+    def monitor(self):
+        """
+        Monitoring script to inventory the JWST filesystem, save file 
+        statistics, and generate plots.
+        """
+    
+        # Begin logging
+        logging.info('Beginning filesystem monitoring.')
+    
+        # re-initialize dictionaries for output
+        results_dict = defaultdict(int)
+        size_dict = defaultdict(float)
+        
+        # Walk through all directories recursively and count files
+        logging.info('Searching filesystem...')
+        for dirpath, dirs, files in os.walk(self.filesystem):
+            results_dict['file_count'] += len(files)  # find number of all files
+            for filename in files:
+                file_path = os.path.join(dirpath, filename)
+                if filename.endswith(".fits"):  # find total number of fits files
+                    results_dict['fits_files'] += 1
+                    size_dict['size_fits'] += os.path.getsize(file_path)
+                    suffix = filename_parser(filename)['suffix']
+                    results_dict[suffix] += 1
+                    size_dict[suffix] += os.path.getsize(file_path)
+                    detector = filename_parser(filename)['detector']
+                    instrument = detector[0:3]  # first three characters of detector specify instrument
+                    results_dict[instrument] += 1
+                    size_dict[instrument] += os.path.getsize(file_path)
+        logging.info('{} files found in filesystem'.format(results_dict['fits_files']))
+    
+        # Get df style stats on file system
+        out = subprocess.check_output('df {}'.format(self.filesystem), shell=True)
+        outstring = out.decode("utf-8")  # put into string for parsing from byte format
+        parsed = outstring.split(sep=None)
+    
+        # Select desired elements from parsed string
+        stats = {
+                'total': int(parsed[8]),  # in blocks of 512 bytes
+                'used': int(parsed[9]),
+                'available': int(parsed[10]),
+                'percent_used': parsed[11],
+                'file_count': results_dict.pop('file_count'),
+                'timestamp': datetime.datetime.now().isoformat(sep='T', timespec='auto')  # get date of stats
+                }
+        
+        #store results & sizes in the appropriate dictionaries
+        for key, val in results_dict.items():
+            self.results[key].append(val)
+        for key, val in size_dict.items():
+            self.sizes[key].append(val)
+        for key, val in stats.items():
+            self.statistics[key].append(val)
+    
+        # set up output file and write stats
+        statsfile = os.path.join(self.outputs_dir, 'statsfile.txt')
+        with open(statsfile, "a+") as f:
+            f.write("{timestamp} {file_count:15d} {total:15d} {available:15d} {used:15d} {percent_used}\n".format(**stats))
+        set_permissions(statsfile)
+        logging.info('Saved file statistics to: {}'.format(statsfile))
+    
+        output_stub = "{fits_files} {uncal} {cal} {rate} {rateints} {i2d} {nrc} {nrs} {nis} {mir} {gui}\n"
+        # set up and read out stats on files by type
+        filesbytype = os.path.join(self.outputs_dir, 'filesbytype.txt')
+        with open(filesbytype, "a+") as f2:
+            f2.write(output_stub.format(**results_dict))
+        set_permissions(filesbytype, verbose=False)
+        logging.info('Saved file statistics by type to {}'.format(filesbytype))
+    
+        # set up file size by type file
+        sizebytype = os.path.join(self.outputs_dir, 'sizebytype.txt')
+        with open(sizebytype, "a+") as f3:
+            f3.write(output_stub.format(**size_dict))
+        set_permissions(sizebytype, verbose=False)
+        logging.info('Saved file sizes by type to {}'.format(sizebytype))
+    
+        logging.info('Filesystem statistics calculation complete.')
+        
+        #Update the plots based on new information
+        self.update_plots()
+        
+    def update_plots(self):
+        """
+        Update the ColumnDataSource objects for the filesystem monitor plots.
+        """
+        
+        logging.info("Beginning filesystem statistics monitor plot updates")
+        
+        # We'll ensure that all the statistics are in the correct formats
+        dates = np.array(self.statistics['timestamp'], dtype='datetime64')
+        
+        self.refs['source_filecount'].data = {
+                'dates': dates,
+                'filecount': np.array(self.statistics['file_count'], dtype=float)
+                }
+        
+        self.refs['source_stats'].data = {
+                'dates': dates,
+                'systemsize': np.array(self.statistics['total'], dtype=float) / (1024.**3),
+                'freesize': np.array(self.statistics['available'], dtype=float) / (1024.**3),
+                'usedsize': np.array(self.statistics['used'], dtype=float) / (1024.**3)
+                }
+        
+        self.refs['source_files'].data = {
+                'dates': dates,
+                'fits': np.array(self.results['fits_files'], dtype=int),
+                'uncal': np.array(self.results['uncal'], dtype=int),
+                'cal': np.array(self.results['cal'], dtype=int),
+                'rate': np.array(self.results['rate'], dtype=int),
+                'rateint': np.array(self.results['rateint'], dtype=int),
+                'i2d': np.array(self.results['i2d'], dtype=int),
+                'nrc': np.array(self.results['nrc'], dtype=int),
+                'nrs': np.array(self.results['nrs'], dtype=int),
+                'nis': np.array(self.results['nis'], dtype=int),
+                'mir': np.array(self.results['mir'], dtype=int),
+                'fgs': np.array(self.results['gui'], dtype=int)
+            }
+        
+        self.refs['source_sizes'].data = {
+                'dates': dates,
+                'fits': np.array(self.sizes['fits_files'], dtype=float) / (1024.**3),
+                'uncal': np.array(self.sizes['uncal'], dtype=float) / (1024.**3),
+                'cal': np.array(self.sizes['cal'], dtype=float) / (1024.**3),
+                'rate': np.array(self.sizes['rate'], dtype=float) / (1024.**3),
+                'rateint': np.array(self.sizes['rateint'], dtype=float) / (1024.**3),
+                'i2d': np.array(self.sizes['i2d'], dtype=float) / (1024.**3),
+                'nrc': np.array(self.sizes['nrc'], dtype=float) / (1024.**3),
+                'nrs': np.array(self.sizes['nrs'], dtype=float) / (1024.**3),
+                'nis': np.array(self.sizes['nis'], dtype=float) / (1024.**3),
+                'mir': np.array(self.sizes['mir'], dtype=float) / (1024.**3),
+                'fgs': np.array(self.sizes['gui'], dtype=float) / (1024.**3)
+            }
+        
+        # Write scripts out to files
+        for name in ['filecount', 'system_stats', 'filecount_type', 'size_type']:
+            script, div = self.embed('fig_'+name)
+            div_outfile = os.path.join(self.outputs_dir, "{}_component.html".format(name))
+            with open(div_outfile, 'w') as f:
+                f.write(div)
+                f.close()
+            set_permissions(div_outfile)
+    
+            script_outfile = os.path.join(self.outputs_dir, "{}_component.js".format(name))
+            with open(script_outfile, 'w') as f:
+                f.write(script)
+                f.close()
+            set_permissions(script_outfile)
+            
+            logging.info('Saved components files: {}_component.html and {}_component.js'.format(name, name))
 
-    # Get path, directories and files in system and count files in all directories
-    settings = get_config()
-    filesystem = settings['filesystem']
-    outputs_dir = os.path.join(settings['outputs'], 'monitor_filesystem')
-
-    # set up dictionaries for output
-    results_dict = defaultdict(int)
-    size_dict = defaultdict(float)
-    # Walk through all directories recursively and count files
-    logging.info('Searching filesystem...')
-    for dirpath, dirs, files in os.walk(filesystem):
-        results_dict['file_count'] += len(files)  # find number of all files
-        for filename in files:
-            file_path = os.path.join(dirpath, filename)
-            if filename.endswith(".fits"):  # find total number of fits files
-                results_dict['fits_files'] += 1
-                size_dict['size_fits'] += os.path.getsize(file_path)
-                suffix = filename_parser(filename)['suffix']
-                results_dict[suffix] += 1
-                size_dict[suffix] += os.path.getsize(file_path)
-                detector = filename_parser(filename)['detector']
-                instrument = detector[0:3]  # first three characters of detector specify instrument
-                results_dict[instrument] += 1
-                size_dict[instrument] += os.path.getsize(file_path)
-    logging.info('{} files found in filesystem'.format(results_dict['fits_files']))
-
-    # Get df style stats on file system
-    out = subprocess.check_output('df {}'.format(filesystem), shell=True)
-    outstring = out.decode("utf-8")  # put into string for parsing from byte format
-    parsed = outstring.split(sep=None)
-
-    # Select desired elements from parsed string
-    total = int(parsed[8])  # in blocks of 512 bytes
-    used = int(parsed[9])
-    available = int(parsed[10])
-    percent_used = parsed[11]
-
-    # Save stats for plotting over time
-    now = datetime.datetime.now().isoformat(sep='T', timespec='auto')  # get date of stats
-
-    # set up output file and write stats
-    statsfile = os.path.join(outputs_dir, 'statsfile.txt')
-    with open(statsfile, "a+") as f:
-        f.write("{0} {1:15d} {2:15d} {3:15d} {4:15d} {5}\n".format(now, results_dict['file_count'],
-                total, available, used, percent_used))
-    set_permissions(statsfile)
-    logging.info('Saved file statistics to: {}'.format(statsfile))
-
-    # set up and read out stats on files by type
-    filesbytype = os.path.join(outputs_dir, 'filesbytype.txt')
-    with open(filesbytype, "a+") as f2:
-        f2.write("{0} {1} {2} {3} {4} {5} {6} {7} {8} {9} {10}\n".format(results_dict['fits_files'],
-                 results_dict['uncal'], results_dict['cal'], results_dict['rate'],
-                 results_dict['rateints'], results_dict['i2d'], results_dict['nrc'],
-                 results_dict['nrs'], results_dict['nis'], results_dict['mir'], results_dict['gui']))
-    set_permissions(filesbytype, verbose=False)
-    logging.info('Saved file statistics by type to {}'.format(filesbytype))
-
-    # set up file size by type file
-    sizebytype = os.path.join(outputs_dir, 'sizebytype.txt')
-    with open(sizebytype, "a+") as f3:
-        f3.write("{0} {1} {2} {3} {4} {5} {6} {7} {8} {9} {10}\n".format(size_dict['size_fits'],
-                 size_dict['uncal'], size_dict['cal'], size_dict['rate'],
-                 size_dict['rateints'], size_dict['i2d'], size_dict['nrc'],
-                 size_dict['nrs'], size_dict['nis'], size_dict['mir'], size_dict['gui']))
-    set_permissions(sizebytype, verbose=False)
-    logging.info('Saved file sizes by type to {}'.format(sizebytype))
-
-    logging.info('Filesystem statistics calculation complete.')
-
-    # Create the plots
-    plot_system_stats(statsfile, filesbytype, sizebytype)
-
-
-def plot_system_stats(stats_file, filebytype, sizebytype):
-    """Read in the file of saved stats over time and plot them.
-
-    Parameters
-    -----------
-    stats_file : str
-        file containing information of stats over time
-    filebytype : str
-        file containing information of file counts by type over
-        time
-    sizebytype : str
-        file containing information on file sizes by type over time
-    """
-
-    # get path for files
-    settings = get_config()
-    outputs_dir = os.path.join(settings['outputs'], 'monitor_filesystem')
-
-    # read in file of statistics
-    date, f_count, sysize, frsize, used, percent = np.loadtxt(stats_file, dtype=str, unpack=True)
-    fits_files, uncalfiles, calfiles, ratefiles, rateintsfiles, i2dfiles, nrcfiles, nrsfiles, nisfiles, mirfiles, fgsfiles = np.loadtxt(filebytype, dtype=str, unpack=True)
-    fits_sz, uncal_sz, cal_sz, rate_sz, rateints_sz, i2d_sz, nrc_sz, nrs_sz, nis_sz, mir_sz, fgs_sz = np.loadtxt(sizebytype, dtype=str, unpack=True)
-    logging.info('Read in file statistics from {}, {}, {}'.format(stats_file, filebytype, sizebytype))
-
-    # put in proper np array types and convert to GB sizes
-    dates = np.array(date, dtype='datetime64')
-    file_count = f_count.astype(float)
-    systemsize = sysize.astype(float) / (1024.**3)
-    freesize = frsize.astype(float) / (1024.**3)
-    usedsize = used.astype(float) / (1024.**3)
-
-    fits = fits_files.astype(int)
-    uncal = uncalfiles.astype(int)
-    cal = calfiles.astype(int)
-    rate = ratefiles.astype(int)
-    rateints = rateintsfiles.astype(int)
-    i2d = i2dfiles.astype(int)
-    nircam = nrcfiles.astype(int)
-    nirspec = nrsfiles.astype(int)
-    niriss = nisfiles.astype(int)
-    miri = mirfiles.astype(int)
-    fgs = fgsfiles.astype(int)
-
-    fits_size = fits_sz.astype(float) / (1024.**3)
-    uncal_size = uncal_sz.astype(float) / (1024.**3)
-    cal_size = cal_sz.astype(float) / (1024.**3)
-    rate_size = rate_sz.astype(float) / (1024.**3)
-    rateints_size = rateints_sz.astype(float) / (1024.**3)
-    i2d_size = i2d_sz.astype(float) / (1024.**3)
-    nircam_size = nrc_sz.astype(float) / (1024.**3)
-    nirspec_size = nrs_sz.astype(float) / (1024.**3)
-    niriss_size = nis_sz.astype(float) / (1024.**3)
-    miri_size = mir_sz.astype(float) / (1024.**3)
-    fgs_size = fgs_sz.astype(float) / (1024.**3)
-
-    # plot the data
-    # Plot filecount vs. date
-    p1 = figure(
-       tools='pan,box_zoom,reset,wheel_zoom,save', x_axis_type='datetime',
-       title="Total File Counts", x_axis_label='Date', y_axis_label='Count')
-    p1.line(dates, file_count, line_width=2, line_color='blue')
-    p1.circle(dates, file_count, color='blue')
-
-    # Plot system stats vs. date
-    p2 = figure(
-      tools='pan,box_zoom,wheel_zoom,reset,save', x_axis_type='datetime',
-      title='System stats', x_axis_label='Date', y_axis_label='GB')
-    p2.line(dates, systemsize, legend='Total size', line_color='red')
-    p2.circle(dates, systemsize, color='red')
-    p2.line(dates, freesize, legend='Free bytes', line_color='blue')
-    p2.circle(dates, freesize, color='blue')
-    p2.line(dates, usedsize, legend='Used bytes', line_color='green')
-    p2.circle(dates, usedsize, color='green')
-
-    # Plot fits files by type vs. date
-    p3 = figure(
-       tools='pan,box_zoom,wheel_zoom,reset,save', x_axis_type='datetime',
-       title="Total File Counts by Type", x_axis_label='Date', y_axis_label='Count')
-    p3.line(dates, fits, legend='Total fits files', line_color='black')
-    p3.circle(dates, fits, color='black')
-    p3.line(dates, uncal, legend='uncalibrated fits files', line_color='red')
-    p3.diamond(dates, uncal, color='red')
-    p3.line(dates, cal, legend='calibrated fits files', line_color='blue')
-    p3.square(date, cal, color='blue')
-    p3.line(dates, rate, legend='rate fits files', line_color='green')
-    p3.triangle(dates, rate, color='green')
-    p3.line(dates, rateints, legend='rateints fits files', line_color='orange')
-    p3.asterisk(dates, rateints, color='orange')
-    p3.line(dates, i2d, legend='i2d fits files', line_color='purple')
-    p3.x(dates, i2d, color='purple')
-    p3.line(dates, nircam, legend='nircam fits files', line_color='midnightblue')
-    p3.x(dates, nircam, color='midnightblue')
-    p3.line(dates, nirspec, legend='nirspec fits files', line_color='springgreen')
-    p3.x(dates, nirspec, color='springgreen')
-    p3.line(dates, niriss, legend='niriss fits files', line_color='darkcyan')
-    p3.x(dates, niriss, color='darkcyan')
-    p3.line(dates, miri, legend='miri fits files', line_color='dodgerblue')
-    p3.x(dates, miri, color='dodgerblue')
-    p3.line(dates, fgs, legend='fgs fits files', line_color='darkred')
-    p3.x(dates, fgs, color='darkred')
-
-    # plot size of total fits files by type
-    p4 = figure(
-       tools='pan,box_zoom,wheel_zoom,reset,save', x_axis_type='datetime',
-       title="Total File Sizes by Type", x_axis_label='Date', y_axis_label='GB')
-    p4.line(dates, fits_size, legend='Total fits files', line_color='black')
-    p4.circle(dates, fits_size, color='black')
-    p4.line(dates, uncal_size, legend='uncalibrated fits files', line_color='red')
-    p4.diamond(dates, uncal_size, color='red')
-    p4.line(dates, cal_size, legend='calibrated fits files', line_color='blue')
-    p4.square(date, cal_size, color='blue')
-    p4.line(dates, rate_size, legend='rate fits files', line_color='green')
-    p4.triangle(dates, rate_size, color='green')
-    p4.line(dates, rateints_size, legend='rateints fits files', line_color='orange')
-    p4.asterisk(dates, rateints_size, color='orange')
-    p4.line(dates, i2d_size, legend='i2d fits files', line_color='purple')
-    p4.x(dates, i2d_size, color='purple')
-    p4.line(dates, nircam_size, legend='nircam fits files', line_color='midnightblue')
-    p4.x(dates, nircam_size, color='midnightblue')
-    p4.line(dates, nirspec_size, legend='nirspec fits files', line_color='springgreen')
-    p4.x(dates, nirspec_size, color='springgreen')
-    p4.line(dates, niriss_size, legend='niriss fits files', line_color='darkcyan')
-    p4.x(dates, niriss_size, color='darkcyan')
-    p4.line(dates, miri_size, legend='miri fits files', line_color='dodgerblue')
-    p4.x(dates, miri_size, color='dodgerblue')
-    p4.line(dates, fgs_size, legend='fgs fits files', line_color='darkred')
-    p4.x(dates, fgs_size, color='darkred')
-
-    # create a layout with a grid pattern to save all plots
-    grid = gridplot([[p1, p2], [p3, p4]])
-    outfile = os.path.join(outputs_dir, "filesystem_monitor.html")
-    output_file(outfile)
-    save(grid)
-    set_permissions(outfile)
-    logging.info('Saved plot of all statistics to {}'.format(outfile))
-
-    # Save each plot's components
-    plots = [p1, p2, p3, p4]
-    plot_names = ['filecount', 'system_stats', 'filecount_type', 'size_type']
-    for plot, name in zip(plots, plot_names):
-        plot.sizing_mode = 'stretch_both'
-        script, div = components(plot)
-
-        div_outfile = os.path.join(outputs_dir, "{}_component.html".format(name))
-        with open(div_outfile, 'w') as f:
-            f.write(div)
-            f.close()
-        set_permissions(div_outfile)
-
-        script_outfile = os.path.join(outputs_dir, "{}_component.js".format(name))
-        with open(script_outfile, 'w') as f:
-            f.write(script)
-            f.close()
-        set_permissions(script_outfile)
-
-        logging.info('Saved components files: {}_component.html and {}_component.js'.format(name, name))
-
-    logging.info('Filesystem statistics plotting complete.')
-
-    # Begin logging:
-    logging.info("Completed.")
+        logging.info('Filesystem statistics plot updates complete.')
+        
 
 
 if __name__ == '__main__':
@@ -329,4 +283,5 @@ if __name__ == '__main__':
     module = os.path.basename(__file__).strip('.py')
     configure_logging(module)
 
-    monitor_filesystem()
+    monitor = MonitorFilesystem()
+    monitor.monitor()

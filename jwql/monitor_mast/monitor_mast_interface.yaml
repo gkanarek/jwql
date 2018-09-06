@@ -1,0 +1,6 @@
+- !Donut: &fig_jwst
+    ref: "fig_jwst"
+    arg: [ !self.jwst_table ]
+- !Donut: &fig_caom
+    ref: "fig_caom"
+    arg: [ !self.caom_table ]
