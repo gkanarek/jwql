@@ -74,9 +74,8 @@ class BokehTemplate(object):
         
         raise NotImplementedError
     
-    def __init__(self, embed=False):
+    def __init__(self):
         self._register_default_constructors()
-        self._embed = embed
         
         #Allow for pre-init stuff from the subclass.
         if self.pre_init is not None:
@@ -132,6 +131,9 @@ class BokehTemplate(object):
         #(and self.document, for the document)
         
         self.full_stream = list(yaml.load_all(interface))
+    
+    def parse_string(self, yaml_string):
+        return list(yaml.load_all(yaml_string))
         
     def embed(self, ref):
         element = self.refs.get(ref, None)
